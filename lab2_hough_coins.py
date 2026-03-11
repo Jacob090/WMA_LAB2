@@ -10,13 +10,12 @@ import numpy as np
 class Coin:
     center: Tuple[int, int]
     radius: int
-    value_gr: int  # coin value in grosz (5zl = 500gr, 5gr = 5gr)
+    value_gr: int
     on_tray: bool
 
 
 @dataclass
 class Tray:
-    # Four corners of the tray rectangle in image coordinates
     top_left: Tuple[int, int]
     top_right: Tuple[int, int]
     bottom_right: Tuple[int, int]
@@ -40,7 +39,6 @@ def detect_tray_rect(image: np.ndarray) -> Optional[Tray]:
 
     edges = cv2.Canny(blurred, 50, 150, apertureSize=3)
 
-    # Standard Hough transform for lines
     lines = cv2.HoughLines(edges, 1, np.pi / 180, threshold=150)
     if lines is None:
         return None
@@ -52,7 +50,6 @@ def detect_tray_rect(image: np.ndarray) -> Optional[Tray]:
 
     for line in lines:
         rho, theta = line[0]
-        # Rough separation: vertical vs horizontal
         if theta < np.pi / 4 or theta > 3 * np.pi / 4:
             vertical_rhos.append(rho)
             vertical_thetas.append(theta)
@@ -63,18 +60,15 @@ def detect_tray_rect(image: np.ndarray) -> Optional[Tray]:
     if len(vertical_rhos) < 2 or len(horizontal_rhos) < 2:
         return None
 
-    # Choose the two extreme vertical and horizontal lines
     left_rho = min(vertical_rhos)
     right_rho = max(vertical_rhos)
     top_rho = min(horizontal_rhos)
     bottom_rho = max(horizontal_rhos)
 
-    # Approximate angles as the mean of corresponding groups
     left_theta = right_theta = float(np.mean(vertical_thetas))
     top_theta = bottom_theta = float(np.mean(horizontal_thetas))
 
     def line_intersection(rho1: float, theta1: float, rho2: float, theta2: float) -> Tuple[int, int]:
-        # Convert from normal form to intersection point
         a1, b1 = np.cos(theta1), np.sin(theta1)
         a2, b2 = np.cos(theta2), np.sin(theta2)
         denom = a1 * b2 - a2 * b1
@@ -95,21 +89,36 @@ def detect_tray_rect(image: np.ndarray) -> Optional[Tray]:
 def detect_coins(image: np.ndarray, tray: Optional[Tray]) -> List[Coin]:
     """
     Detect coins using Hough circle transform.
-    Returns list of Coin objects with estimated value and tray membership.
+    Zastosowano mocniejsze wstępne przetwarzanie oraz węższy,
+    skalowany względem rozmiaru obrazu zakres promieni, aby
+    zredukować liczbę fałszywych detekcji.
     """
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    gray = cv2.medianBlur(gray, 5)
 
-    # Hough transform for circles
+    # Wyrównanie kontrastu i redukcja szumu
+    gray = cv2.GaussianBlur(gray, (7, 7), 0)
+    gray = cv2.medianBlur(gray, 5)
+    gray = cv2.equalizeHist(gray)
+
+    h, w = gray.shape[:2]
+    base = min(h, w)
+
+    # Zakładamy, że promień monety to kilka procent wymiaru obrazu.
+    min_radius = int(base * 0.035)
+    max_radius = int(base * 0.09)
+    min_radius = max(min_radius, 10)
+
+    min_dist = int(min_radius * 1.2)
+
     circles = cv2.HoughCircles(
         gray,
         cv2.HOUGH_GRADIENT,
-        dp=1.2,
-        minDist=30,
-        param1=100,
-        param2=30,
-        minRadius=10,
-        maxRadius=0,  # let OpenCV estimate upper bound
+        dp=1.3,
+        minDist=min_dist,
+        param1=120,
+        param2=60,
+        minRadius=min_radius,
+        maxRadius=max_radius,
     )
 
     if circles is None:
@@ -121,16 +130,12 @@ def detect_coins(image: np.ndarray, tray: Optional[Tray]) -> List[Coin]:
     if not radii:
         return []
 
-    # Separate two denominations based on radius.
-    # We dynamically compute a threshold between small and large coins.
     min_r, max_r = float(min(radii)), float(max(radii))
     if max_r - min_r < 3:
-        # Radii too similar, fall back to treating everything as small coins (5gr)
         threshold = max_r + 1.0
     else:
         threshold = (min_r + max_r) / 2.0
 
-    # Prepare tray polygon for point-in-polygon test
     tray_poly = tray.polygon if tray is not None else None
 
     detected: List[Coin] = []
@@ -140,10 +145,8 @@ def detect_coins(image: np.ndarray, tray: Optional[Tray]) -> List[Coin]:
         if tray_poly is not None:
             inside = cv2.pointPolygonTest(tray_poly, (int(x), int(y)), measureDist=False) >= 0
         else:
-            # If tray not detected, assume everything is "on tray"
             inside = True
 
-        # Classify coin value: larger radius -> 5zł, smaller -> 5gr
         if radius >= threshold:
             value_gr = 500
         else:
@@ -160,15 +163,13 @@ def draw_results(image: np.ndarray, tray: Optional[Tray], coins: List[Coin]) -> 
     """
     output = image.copy()
 
-    # Draw tray
     if tray is not None:
         pts = tray.polygon.reshape((-1, 1, 2))
         cv2.polylines(output, [pts], isClosed=True, color=(0, 255, 0), thickness=2)
 
-    # Draw coins
     for coin in coins:
         x, y = coin.center
-        color = (0, 255, 255) if coin.value_gr == 500 else (255, 255, 0)  # 5zł: yellow, 5gr: cyan
+        color = (0, 255, 255) if coin.value_gr == 500 else (255, 255, 0)
         cv2.circle(output, (x, y), coin.radius, color, 2)
         cv2.circle(output, (x, y), 2, (0, 0, 255), 3)
 
@@ -225,7 +226,6 @@ def process_image(path: str) -> None:
 
     output = draw_results(image, tray, coins)
 
-    # Show image with annotations
     window_name = os.path.basename(path)
     cv2.imshow(window_name, output)
     cv2.waitKey(0)
